@@ -1,6 +1,7 @@
 # ComfyUI Node for Ultimate SD Upscale by Coyote-A: https://github.com/Coyote-A/ultimate-upscale-for-automatic1111
 
 import logging
+from contextlib import contextmanager
 import torch
 import comfy
 from usdu_patch import usdu
@@ -8,6 +9,20 @@ from usdu_utils import tensor_to_pil, pil_to_tensor
 from modules.processing import StableDiffusionProcessing
 import modules.shared as shared
 from modules.upscaler import UpscalerData
+
+logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def suppress_logging(level=logging.CRITICAL + 1):
+    """Context manager to temporarily suppress logging output."""
+    root_logger = logging.getLogger()
+    old_level = root_logger.getEffectiveLevel()
+    root_logger.setLevel(level)
+    try:
+        yield
+    finally:
+        root_logger.setLevel(old_level)
 
 MAX_RESOLUTION = 8192
 # The modes available for Ultimate SD Upscale
@@ -56,6 +71,7 @@ def USDU_base_inputs():
         # Misc
         ("force_uniform_tiles", ("BOOLEAN", {"default": True, "tooltip": "Force all tiles to be the same as the set tile size, even when tiles could be smaller. This can help prevent the model from working with irregular tile sizes."})),
         ("tiled_decode", ("BOOLEAN", {"default": False, "tooltip": "Whether to use tiled decoding when decoding tiles."})),
+        ("batch_size", ("INT", {"default": 1, "min": 1, "max": 4096, "step": 1, "tooltip": "The number of tiles to process in a batch. Higher values can reduce processing time but use more VRAM. Yields different results than individual tiles. Only affects the main redraw step, not the seam fix step."})),
     ]
 
     optional = []
@@ -107,20 +123,10 @@ class UltimateSDUpscale:
                 steps, cfg, sampler_name, scheduler, denoise, upscale_model,
                 mode_type, tile_width, tile_height, mask_blur, tile_padding,
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
-                seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode, 
+                seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode, batch_size=1,
                 custom_sampler=None, custom_sigmas=None):
-        # Store params
-        self.tile_width = tile_width
-        self.tile_height = tile_height
-        self.mask_blur = mask_blur
-        self.tile_padding = tile_padding
-        self.seam_fix_width = seam_fix_width
-        self.seam_fix_denoise = seam_fix_denoise
-        self.seam_fix_padding = seam_fix_padding
-        self.seam_fix_mode = seam_fix_mode
-        self.mode_type = mode_type
-        self.upscale_by = upscale_by
-        self.seam_fix_mask_blur = seam_fix_mask_blur
+        redraw_mode = MODES[mode_type]
+        seam_fix_mode = SEAM_FIX_MODES[seam_fix_mode]
 
         #
         # Set up A1111 patches
@@ -136,38 +142,36 @@ class UltimateSDUpscale:
         shared.batch = [tensor_to_pil(image, i) for i in range(len(image))]
         shared.batch_as_tensor = image
 
+        logger.debug("UltimateSDUpscale.upscale() using batch_size=%s", batch_size)
+        assert batch_size == 1 or force_uniform_tiles, "batch_size greater than 1 requires force_uniform_tiles to be True; all tiles in the batch must be the same size."
+
         # Processing
         sdprocessing = StableDiffusionProcessing(
             shared.batch[0], model, positive, negative, vae,
             seed, steps, cfg, sampler_name, scheduler, denoise, upscale_by, force_uniform_tiles, tiled_decode,
-            tile_width, tile_height, MODES[self.mode_type], SEAM_FIX_MODES[self.seam_fix_mode],
-            custom_sampler, custom_sigmas,
+            tile_width, tile_height, redraw_mode, seam_fix_mode,
+            custom_sampler, custom_sigmas, batch_size,
         )
+        logger.debug("StableDiffusionProcessing created with batch_size=%s", sdprocessing.batch_size)
 
-        # Disable logging
-        logger = logging.getLogger()
-        old_level = logger.getEffectiveLevel()
-        logger.setLevel(logging.CRITICAL + 1)
-        try:
+        # Suppress logging to prevent duplicate tqdm progress bars
+        with suppress_logging():
             #
             # Running the script
             #
             script = usdu.Script()
-            processed = script.run(p=sdprocessing, _=None, tile_width=self.tile_width, tile_height=self.tile_height,
-                               mask_blur=self.mask_blur, padding=self.tile_padding, seams_fix_width=self.seam_fix_width,
-                               seams_fix_denoise=self.seam_fix_denoise, seams_fix_padding=self.seam_fix_padding,
-                               upscaler_index=0, save_upscaled_image=False, redraw_mode=MODES[self.mode_type],
-                               save_seams_fix_image=False, seams_fix_mask_blur=self.seam_fix_mask_blur,
-                               seams_fix_type=SEAM_FIX_MODES[self.seam_fix_mode], target_size_type=2,
-                               custom_width=None, custom_height=None, custom_scale=self.upscale_by)
+            processed = script.run(p=sdprocessing, _=None, tile_width=tile_width, tile_height=tile_height,
+                               mask_blur=mask_blur, padding=tile_padding, seams_fix_width=seam_fix_width,
+                               seams_fix_denoise=seam_fix_denoise, seams_fix_padding=seam_fix_padding,
+                               upscaler_index=0, save_upscaled_image=False, redraw_mode=redraw_mode,
+                               save_seams_fix_image=False, seams_fix_mask_blur=seam_fix_mask_blur,
+                               seams_fix_type=seam_fix_mode, target_size_type=2,
+                               custom_width=None, custom_height=None, custom_scale=upscale_by)
 
-            # Return the resulting images
-            images = [pil_to_tensor(img) for img in shared.batch]
-            tensor = torch.cat(images, dim=0)
-            return (tensor,)
-        finally:
-            # Restore the original logging level
-            logger.setLevel(old_level)
+        # Return the resulting images
+        images = [pil_to_tensor(img) for img in shared.batch]
+        tensor = torch.cat(images, dim=0)
+        return (tensor,)
 
 class UltimateSDUpscaleNoUpscale(UltimateSDUpscale):
     @classmethod
@@ -188,13 +192,16 @@ class UltimateSDUpscaleNoUpscale(UltimateSDUpscale):
                 steps, cfg, sampler_name, scheduler, denoise,
                 mode_type, tile_width, tile_height, mask_blur, tile_padding,
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
-                seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode):
+                seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode, batch_size=1):
         upscale_by = 1.0
+
+        logger.debug("UltimateSDUpscaleNoUpscale.upscale() received batch_size=%s", batch_size)
+
         return super().upscale(upscaled_image, model, positive, negative, vae, upscale_by, seed,
                                steps, cfg, sampler_name, scheduler, denoise, None,
                                mode_type, tile_width, tile_height, mask_blur, tile_padding,
                                seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
-                               seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode)
+                               seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode, batch_size)
     
 class UltimateSDUpscaleCustomSample(UltimateSDUpscale):
     @classmethod
@@ -205,7 +212,7 @@ class UltimateSDUpscaleCustomSample(UltimateSDUpscale):
         optional.append(("custom_sampler", ("SAMPLER", {"tooltip": "A custom sampler to use instead of the built-in ComfyUI sampler specified by sampler_name. Only used if both custom_sampler and custom_sigmas are provided."})))
         optional.append(("custom_sigmas", ("SIGMAS", {"tooltip": "A custom noise schedule to use during sampling. Only used if both custom_sampler and custom_sigmas are provided."})))
         return prepare_inputs(required, optional)
-    
+
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "upscale"
     CATEGORY = "image/upscaling"
@@ -216,28 +223,27 @@ class UltimateSDUpscaleCustomSample(UltimateSDUpscale):
                 steps, cfg, sampler_name, scheduler, denoise,
                 mode_type, tile_width, tile_height, mask_blur, tile_padding,
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
-                seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode,
+                seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode, batch_size=1,
                 upscale_model=None,
                 custom_sampler=None, custom_sigmas=None):
         return super().upscale(image, model, positive, negative, vae, upscale_by, seed,
                 steps, cfg, sampler_name, scheduler, denoise, upscale_model,
                 mode_type, tile_width, tile_height, mask_blur, tile_padding,
                 seam_fix_mode, seam_fix_denoise, seam_fix_mask_blur,
-                seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode,
+                seam_fix_width, seam_fix_padding, force_uniform_tiles, tiled_decode, batch_size,
                 custom_sampler, custom_sigmas)
-
 
 # A dictionary that contains all nodes you want to export with their names
 # NOTE: names should be globally unique
 NODE_CLASS_MAPPINGS = {
     "UltimateSDUpscale": UltimateSDUpscale,
     "UltimateSDUpscaleNoUpscale": UltimateSDUpscaleNoUpscale,
-    "UltimateSDUpscaleCustomSample": UltimateSDUpscaleCustomSample
+    "UltimateSDUpscaleCustomSample": UltimateSDUpscaleCustomSample,
 }
 
 # A dictionary that contains the friendly/humanly readable titles for the nodes
 NODE_DISPLAY_NAME_MAPPINGS = {
     "UltimateSDUpscale": "Ultimate SD Upscale",
     "UltimateSDUpscaleNoUpscale": "Ultimate SD Upscale (No Upscale)",
-    "UltimateSDUpscaleCustomSample": "Ultimate SD Upscale (Custom Sample)"
+    "UltimateSDUpscaleCustomSample": "Ultimate SD Upscale (Custom Sample)",
 }
