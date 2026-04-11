@@ -15,17 +15,10 @@ import logging
 import math
 from typing import Tuple, List
 
-from PIL import Image, ImageFilter, ImageDraw
-import torch
-from tqdm import tqdm
-
-from comfy_extras.nodes_custom_sampler import SamplerCustom
-from crop_model_patch import crop_model_cond
-from nodes import common_ksampler, VAEEncode, VAEDecode, VAEDecodeTiled
-
+from PIL import Image
 import modules.shared as shared
+from modules.processing import process_batch_tiles
 from repositories import ultimate_upscale as usdu
-import usdu_utils
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.StreamHandler())
@@ -46,33 +39,6 @@ def round_length(length: int, multiple: int = 8) -> int:
     """Round length to nearest multiple (default 8)."""
     return round(length / multiple) * multiple
 
-
-
-
-def _sample(model, seed, steps, cfg, sampler_name, scheduler, positive, negative, latent, denoise, custom_sampler, custom_sigmas):
-    """Sampling wrapper that supports a custom sampler or falls back to common_ksampler."""
-    if custom_sampler is not None and custom_sigmas is not None:
-        kwargs = dict(
-            model=model,
-            add_noise=True,
-            noise_seed=seed,
-            cfg=cfg,
-            positive=positive,
-            negative=negative,
-            sampler=custom_sampler,
-            sigmas=custom_sigmas,
-            latent_image=latent
-        )
-        if hasattr(SamplerCustom, "execute"):
-            (samples, _) = SamplerCustom.execute(**kwargs)
-        else:
-            custom_sample = SamplerCustom()
-            (samples, _) = getattr(custom_sample, custom_sample.FUNCTION)(**kwargs)
-        return samples
-
-    (samples,) = common_ksampler(model, seed, steps, cfg, sampler_name,
-                                 scheduler, positive, negative, latent, denoise=denoise)
-    return samples
 
 
 # -------------------------
@@ -203,135 +169,6 @@ usdu.Script.run = patched_script_run
 
 
 # -------------------------
-# Batch processing helpers shared between linear and chess modes
-# -------------------------
-def _prepare_tile_for_batch(calc_rectangle_fn, current_image: Image.Image, tx: int, ty: int, p) -> Tuple[Image.Image, Tuple[int, int, int, int], Image.Image, Tuple[int, int]]:
-    """
-    Prepare cropped/resized tile, mask, crop-region and tile-size for encoding.
-    Returns: (cropped_tile, initial_tile_size, tile_mask, tile_size)
-    """
-    tile_mask = Image.new("L", (current_image.width, current_image.height), "black")
-    tile_draw = ImageDraw.Draw(tile_mask)
-    tile_draw.rectangle(calc_rectangle_fn(tx, ty), fill="white")
-
-    crop_region = usdu_utils.get_crop_region(tile_mask, p.inpaint_full_res_padding)
-
-    if p.uniform_tile_mode:
-        x1, y1, x2, y2 = crop_region
-        crop_w = x2 - x1
-        crop_h = y2 - y1
-        crop_ratio = crop_w / crop_h if crop_h != 0 else 1.0
-        p_ratio = p.width / p.height if p.height != 0 else 1.0
-        if crop_ratio > p_ratio:
-            target_w = crop_w
-            target_h = round(crop_w / p_ratio)
-        else:
-            target_w = round(crop_h * p_ratio)
-            target_h = crop_h
-        crop_region, _ = usdu_utils.expand_crop(crop_region, tile_mask.width, tile_mask.height, target_w, target_h)
-        tile_size = (p.width, p.height)
-    else:
-        x1, y1, x2, y2 = crop_region
-        crop_w = x2 - x1
-        crop_h = y2 - y1
-        target_w = math.ceil(crop_w / 8) * 8
-        target_h = math.ceil(crop_h / 8) * 8
-        crop_region, tile_size = usdu_utils.expand_crop(crop_region, tile_mask.width, tile_mask.height, target_w, target_h)
-
-    # Optional blur
-    if getattr(p, "mask_blur", 0) > 0:
-        tile_mask = tile_mask.filter(ImageFilter.GaussianBlur(p.mask_blur))
-
-    cropped_tile = current_image.crop(crop_region)
-    initial_tile_size = cropped_tile.size
-    if cropped_tile.size != tile_size:
-        cropped_tile = cropped_tile.resize(tile_size, Image.Resampling.LANCZOS)
-
-    return cropped_tile, initial_tile_size, tile_mask, crop_region, tile_size
-
-
-def _process_batch_tiles(p,
-                         tiles_coords: List[Tuple[int, int]],
-                         images: List[Image.Image],
-                         calc_rectangle_fn,
-                         vae_encoder: VAEEncode,
-                         vae_decoder: VAEDecode,
-                         vae_decoder_tiled: VAEDecodeTiled) -> List[Image.Image]:
-    """Encode, sample and decode a batch of tiles and composite them into the given images."""
-    if not tiles_coords or not images:
-        return images
-
-    if p.progress_bar_enabled and p.pbar is None:
-        p.pbar = tqdm(total=getattr(p, "tiles", 0), desc='USDU', unit='tile')
-
-    batch_tiles = []
-    batch_masks = []
-    batch_crop_regions = []
-    batch_tile_sizes = []
-
-    for image in images:
-        for tx, ty in tiles_coords:
-            cropped_tile, initial_tile_size, tile_mask, crop_region, tile_size = _prepare_tile_for_batch(calc_rectangle_fn, image, tx, ty, p)
-            batch_tiles.append((cropped_tile, initial_tile_size))
-            batch_masks.append(tile_mask)
-            batch_crop_regions.append(crop_region)
-            batch_tile_sizes.append(tile_size)
-
-    # Encode tiles -> latent
-    batched_tensors = torch.cat([usdu_utils.pil_to_tensor(tile) for tile, _ in batch_tiles], dim=0)
-    (latent,) = vae_encoder.encode(p.vae, batched_tensors)
-
-    # Condition from first tile (assume same)
-    first_tile_size = batch_tile_sizes[0]
-    positive_cropped = usdu_utils.crop_cond(p.positive, batch_crop_regions, p.init_size, images[0].size, first_tile_size)
-    negative_cropped = usdu_utils.crop_cond(p.negative, batch_crop_regions, p.init_size, images[0].size, first_tile_size)
-
-    with crop_model_cond(p.model, batch_crop_regions, p.init_size, images[0].size, first_tile_size) as model:
-        # Sampling
-        samples = _sample(model, p.seed, p.steps, p.cfg, p.sampler_name, p.scheduler,
-                        positive_cropped, negative_cropped, latent, p.denoise,
-                        p.custom_sampler, p.custom_sigmas)
-
-    # Update progress bar
-    if p.progress_bar_enabled:
-        p.pbar.update(len(tiles_coords))
-
-    # Decode
-    if not getattr(p, "tiled_decode", False):
-        (decoded,) = vae_decoder.decode(p.vae, samples)
-    else:
-        (decoded,) = vae_decoder_tiled.decode(p.vae, samples, 512)
-
-    # Composite tiles back
-    result_imgs = images
-    for i, result_img in enumerate(result_imgs):
-        for j, (tx, ty) in enumerate(tiles_coords):
-            idx = i * len(tiles_coords) + j
-            tile_sampled = usdu_utils.tensor_to_pil(decoded, idx)
-            initial_tile_size = batch_tiles[idx][1]
-            crop_region = batch_crop_regions[idx]
-            tile_mask = batch_masks[idx]
-
-            if tile_sampled.size != initial_tile_size:
-                tile_sampled = tile_sampled.resize(initial_tile_size, Image.Resampling.LANCZOS)
-
-            image_tile_only = Image.new('RGBA', result_img.size)
-            image_tile_only.paste(tile_sampled, crop_region[:2])
-
-            # Add mask as alpha and composite
-            temp = image_tile_only.copy()
-            temp.putalpha(tile_mask)
-            image_tile_only.paste(temp, image_tile_only)
-
-            result = result_img.convert('RGBA')
-            result.alpha_composite(image_tile_only)
-            result_img = result.convert('RGB')
-            result_imgs[i] = result_img
-
-    return result_imgs
-
-
-# -------------------------
 # Replace USDURedraw.linear_process and chess_process with batched variants
 # -------------------------
 def patch_usdu_linear_and_chess_process():
@@ -348,10 +185,6 @@ def patch_usdu_linear_and_chess_process():
             return old_linear(self, p, image, rows, cols)
 
         # Batch mode
-        vae_encoder = VAEEncode()
-        vae_decoder = VAEDecode()
-        vae_decoder_tiled = VAEDecodeTiled()
-
         mask_template, draw_template = self.init_draw(p, image.width, image.height)
         tiles_to_process: List[Tuple[int, int]] = []
         batch_count = 0
@@ -366,7 +199,7 @@ def patch_usdu_linear_and_chess_process():
                 if len(tiles_to_process) >= batch_size or (yi == rows - 1 and xi == cols - 1):
                     batch_count += 1
                     logger.info("[USDU Batch Debug] Processing batch #%s with %s tiles: %s", batch_count, len(tiles_to_process), tiles_to_process)
-                    shared.batch = _process_batch_tiles(p, tiles_to_process, shared.batch, self.calc_rectangle, vae_encoder, vae_decoder, vae_decoder_tiled)
+                    shared.batch = process_batch_tiles(p, tiles_to_process, shared.batch, self.calc_rectangle)
                     tiles_to_process = []
 
         logger.info("[USDU Batch Debug] Linear processing complete. Processed %s batches total.", batch_count)
@@ -380,10 +213,6 @@ def patch_usdu_linear_and_chess_process():
         batch_size = getattr(p, 'batch_size', 1)
         if batch_size <= 1:
             return old_chess(self, p, image, rows, cols)
-
-        vae_encoder = VAEEncode()
-        vae_decoder = VAEDecode()
-        vae_decoder_tiled = VAEDecodeTiled()
 
         mask_template, draw_template = self.init_draw(p, image.width, image.height)
 
@@ -413,10 +242,10 @@ def patch_usdu_linear_and_chess_process():
                     break
                 tiles_to_process.append((tx, ty))
                 if len(tiles_to_process) >= batch_size:
-                    shared.batch = _process_batch_tiles(p, tiles_to_process, shared.batch, self.calc_rectangle, vae_encoder, vae_decoder, vae_decoder_tiled)
+                    shared.batch = process_batch_tiles(p, tiles_to_process, shared.batch, self.calc_rectangle)
                     tiles_to_process = []
             if tiles_to_process:
-                shared.batch = _process_batch_tiles(p, tiles_to_process, shared.batch, self.calc_rectangle, vae_encoder, vae_decoder, vae_decoder_tiled)
+                shared.batch = process_batch_tiles(p, tiles_to_process, shared.batch, self.calc_rectangle)
 
         p.width = image.width
         p.height = image.height

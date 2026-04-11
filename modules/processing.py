@@ -1,4 +1,4 @@
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, ImageDraw
 import logging
 import torch
 import math
@@ -11,7 +11,7 @@ import comfy.utils as comfy_utils
 from enum import Enum
 import json
 import os
-from typing import Optional
+from typing import Callable, List, Optional, Tuple
 from crop_model_patch import crop_model_cond
 
 logger = logging.getLogger(__name__)
@@ -284,3 +284,122 @@ def process_images(p: StableDiffusionProcessing) -> Processed:
 
     processed = Processed(p, [shared.batch[0]], p.seed, "")
     return processed
+
+
+def process_batch_tiles(
+    p: StableDiffusionProcessing,
+    tiles_coords: List[Tuple[int, int]],
+    images: List[Image.Image],
+    calc_rectangle_fn: Callable,
+) -> List[Image.Image]:
+    """Encode, sample and decode a batch of tiles and composite them back into *images*.
+
+    Unlike process_images() which operates on a single pre-built mask, this function
+    builds per-tile masks from *calc_rectangle_fn* and handles every (tile, image)
+    combination in one batched encode → sample → decode pass.
+    """
+    if not tiles_coords or not images:
+        return images
+
+    if p.progress_bar_enabled and p.pbar is None:
+        p.pbar = tqdm(total=getattr(p, "tiles", 0), desc='USDU', unit='tile')
+
+    batch_tiles: List[Tuple[Image.Image, Tuple[int, int]]] = []
+    batch_masks: List[Image.Image] = []
+    batch_crop_regions: List[Tuple[int, int, int, int]] = []
+    batch_tile_sizes: List[Tuple[int, int]] = []
+
+    for image in images:
+        for tx, ty in tiles_coords:
+            tile_mask = Image.new("L", (image.width, image.height), "black")
+            tile_draw = ImageDraw.Draw(tile_mask)
+            tile_draw.rectangle(calc_rectangle_fn(tx, ty), fill="white")
+
+            crop_region = get_crop_region(tile_mask, p.inpaint_full_res_padding)
+
+            if p.uniform_tile_mode:
+                x1, y1, x2, y2 = crop_region
+                crop_w = x2 - x1
+                crop_h = y2 - y1
+                crop_ratio = crop_w / crop_h if crop_h != 0 else 1.0
+                p_ratio = p.width / p.height if p.height != 0 else 1.0
+                if crop_ratio > p_ratio:
+                    target_w = crop_w
+                    target_h = round(crop_w / p_ratio)
+                else:
+                    target_w = round(crop_h * p_ratio)
+                    target_h = crop_h
+                crop_region, _ = expand_crop(crop_region, tile_mask.width, tile_mask.height, target_w, target_h)
+                tile_size: Tuple[int, int] = (p.width, p.height)
+            else:
+                x1, y1, x2, y2 = crop_region
+                crop_w = x2 - x1
+                crop_h = y2 - y1
+                target_w = math.ceil(crop_w / 8) * 8
+                target_h = math.ceil(crop_h / 8) * 8
+                crop_region, tile_size = expand_crop(crop_region, tile_mask.width, tile_mask.height, target_w, target_h)
+
+            if p.mask_blur > 0:
+                tile_mask = tile_mask.filter(ImageFilter.GaussianBlur(p.mask_blur))
+
+            cropped_tile = image.crop(crop_region)
+            initial_tile_size = cropped_tile.size
+            if cropped_tile.size != tile_size:
+                cropped_tile = cropped_tile.resize(tile_size, Image.Resampling.LANCZOS)
+
+            batch_tiles.append((cropped_tile, initial_tile_size))
+            batch_masks.append(tile_mask)
+            batch_crop_regions.append(crop_region)
+            batch_tile_sizes.append(tile_size)
+
+    # Encode all tiles into a single latent batch
+    batched_tensors = torch.cat([pil_to_tensor(tile) for tile, _ in batch_tiles], dim=0)
+    (latent,) = p.vae_encoder.encode(p.vae, batched_tensors)
+
+    # Crop conditioning using the full list of regions (first tile size assumed uniform)
+    first_tile_size = batch_tile_sizes[0]
+    positive_cropped = crop_cond(p.positive, batch_crop_regions, p.init_size, images[0].size, first_tile_size)
+    negative_cropped = crop_cond(p.negative, batch_crop_regions, p.init_size, images[0].size, first_tile_size)
+
+    with crop_model_cond(p.model, batch_crop_regions, p.init_size, images[0].size, first_tile_size) as model:
+        samples = sample(model, p.seed, p.steps, p.cfg, p.sampler_name, p.scheduler,
+                         positive_cropped, negative_cropped, latent, p.denoise,
+                         p.custom_sampler, p.custom_sigmas)
+
+    # Update progress bar once per batch call (one step per tile coord)
+    if p.progress_bar_enabled:
+        assert p.pbar is not None
+        p.pbar.update(len(tiles_coords))
+
+    # Decode
+    if not p.tiled_decode:
+        (decoded,) = p.vae_decoder.decode(p.vae, samples)
+    else:
+        (decoded,) = p.vae_decoder_tiled.decode(p.vae, samples, 512)
+
+    # Composite each decoded tile back onto its source image
+    result_imgs = list(images)
+    for i, result_img in enumerate(result_imgs):
+        for j in range(len(tiles_coords)):
+            idx = i * len(tiles_coords) + j
+            tile_sampled = tensor_to_pil(decoded, idx)
+            initial_tile_size = batch_tiles[idx][1]
+            crop_region = batch_crop_regions[idx]
+            tile_mask = batch_masks[idx]
+
+            if tile_sampled.size != initial_tile_size:
+                tile_sampled = tile_sampled.resize(initial_tile_size, Image.Resampling.LANCZOS)
+
+            image_tile_only = Image.new('RGBA', result_img.size)
+            image_tile_only.paste(tile_sampled, crop_region[:2])
+
+            temp = image_tile_only.copy()
+            temp.putalpha(tile_mask)
+            image_tile_only.paste(temp, image_tile_only)
+
+            result = result_img.convert('RGBA')
+            result.alpha_composite(image_tile_only)
+            result_img = result.convert('RGB')
+            result_imgs[i] = result_img
+
+    return result_imgs

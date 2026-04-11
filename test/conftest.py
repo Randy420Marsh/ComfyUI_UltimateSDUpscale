@@ -55,6 +55,11 @@ def pytest_configure(config):
     args.disable_all_custom_nodes = True
     # Assumes the name of the custom node folder is ComfyUI_UltimateSDUpscale
     args.whitelist_custom_nodes = ["ComfyUI_UltimateSDUpscale"]
+    args.enable_dynamic_vram = False
+
+    import comfy_aimdo.control as aimdo_control
+    if not aimdo_control.init():
+        logging.warning("comfy-aimdo failed to initialize, tests may fail")
 
 
 #
